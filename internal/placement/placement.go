@@ -112,7 +112,7 @@ func (s Selector) Select(ctx context.Context, req Request, check RegionCheck) (P
 
 	noRegionCouldBeJudged := len(checkErrs) > 0 && len(checkErrs) == len(rejected)
 	if noRegionCouldBeJudged {
-		return nil, s.recordUnjudged(ctx, req.VMSize, req.OS, now, fmt.Errorf("failed to check any region: %w", errors.Join(checkErrs...)))
+		return nil, s.recordUnjudged(req.VMSize, req.OS, now, fmt.Errorf("failed to check any region: %w", errors.Join(checkErrs...)))
 	}
 	if req.OnDemandFallback {
 		return OnDemand{Region: req.HomeRegion}, nil
@@ -141,7 +141,10 @@ func (s Selector) ranking(ctx context.Context, vmSize string, osType OS, now tim
 		if haveCache {
 			return cached, nil
 		}
-		return nil, s.recordUnjudged(ctx, vmSize, osType, now, err)
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		return nil, s.recordUnjudged(vmSize, osType, now, err)
 	}
 
 	for rankedOS, ranking := range fresh {
@@ -155,11 +158,7 @@ func (s Selector) ranking(ctx context.Context, vmSize string, osType OS, now tim
 	return fresh[osType], nil
 }
 
-// A cancelled create says nothing about Spot capacity, so it records nothing.
-func (s Selector) recordUnjudged(ctx context.Context, vmSize string, osType OS, now time.Time, cause error) error {
-	if ctx.Err() != nil {
-		return cause
-	}
+func (s Selector) recordUnjudged(vmSize string, osType OS, now time.Time, cause error) error {
 	if err := s.State.recordNoSpot(osType, vmSize, []Rejection{{Reason: cause.Error()}}, now); err != nil {
 		return errors.Join(cause, err)
 	}
