@@ -104,6 +104,9 @@ func newExtraSpecsFromBootstrapData(data params.BootstrapInstance) (*extraSpecs,
 
 type extraSpecs struct {
 	Spot                     bool                                      `json:"spot,omitempty" jsonschema:"description=Launch the VM as an Azure Spot VM."`
+	RegionSelection          config.RegionSelection                    `json:"region_selection,omitempty" jsonschema:"enum=fixed,enum=cheapest,description=Where a Spot VM is created. fixed uses the configured location. cheapest picks the cheapest usable region."`
+	CandidateRegions         []string                                  `json:"candidate_regions,omitempty" jsonschema:"description=The regions that cheapest region selection may pick. An empty list allows every region that has a Spot price."`
+	OnDemandFallback         *bool                                     `json:"on_demand_fallback,omitempty" jsonschema:"description=Create a regular VM in the home region when no region can take a Spot VM."`
 	AllocatePublicIP         bool                                      `json:"allocate_public_ip,omitempty" jsonschema:"description=Allocate a public IP to the VM."`
 	OpenInboundPorts         map[armnetwork.SecurityRuleProtocol][]int `json:"open_inbound_ports,omitempty" jsonschema:"description=A map of protocol to list of inbound ports to open."`
 	StorageAccountType       armcompute.StorageAccountTypes            `json:"storage_account_type,omitempty" jsonschema:"description=Azure storage account type. Default is Standard_LRS."`
@@ -256,11 +259,62 @@ func GetRunnerSpecFromBootstrapParams(data params.BootstrapInstance, controllerI
 		spec.DiskSizeGB = defaultDiskSizeGB
 	}
 
+	spec.CheapestRegion, err = newCheapestRegion(extraSpecs, cfg, spec.VnetSubnetID != "" && spec.DisableIsolatedNetworks)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := spec.Validate(); err != nil {
 		return nil, fmt.Errorf("error validating spec: %w", err)
 	}
 
 	return spec, nil
+}
+
+type CheapestRegion struct {
+	CandidateRegions []string
+	OnDemandFallback bool
+	HomeRegion       string
+}
+
+func newCheapestRegion(extraSpecs *extraSpecs, cfg *config.Config, usesExistingSubnet bool) (*CheapestRegion, error) {
+	selection := cfg.RegionSelection
+	if extraSpecs.RegionSelection != "" {
+		selection = extraSpecs.RegionSelection
+	}
+	if err := selection.Validate(); err != nil {
+		return nil, err
+	}
+	if !extraSpecs.Spot || selection != config.RegionSelectionCheapest {
+		return nil, nil
+	}
+
+	if cfg.StateDir == "" {
+		return nil, fmt.Errorf("region_selection %q requires state_dir in the provider config", config.RegionSelectionCheapest)
+	}
+	if usesExistingSubnet {
+		return nil, fmt.Errorf("region_selection %q cannot use vnet_subnet_id, because a subnet exists in one region only", config.RegionSelectionCheapest)
+	}
+
+	cheapest := &CheapestRegion{
+		OnDemandFallback: cfg.OnDemandFallback,
+		HomeRegion:       config.NormalizeRegion(cfg.HomeRegion),
+	}
+	if cheapest.HomeRegion == "" {
+		cheapest.HomeRegion = config.NormalizeRegion(cfg.Location)
+	}
+	if extraSpecs.OnDemandFallback != nil {
+		cheapest.OnDemandFallback = *extraSpecs.OnDemandFallback
+	}
+
+	candidates := cfg.CandidateRegions
+	if len(extraSpecs.CandidateRegions) > 0 {
+		candidates = extraSpecs.CandidateRegions
+	}
+	for _, region := range candidates {
+		cheapest.CandidateRegions = append(cheapest.CandidateRegions, config.NormalizeRegion(region))
+	}
+	return cheapest, nil
 }
 
 type RunnerSpec struct {
@@ -285,6 +339,7 @@ type RunnerSpec struct {
 	DisableUpdates           bool
 	ExtraPackages            []string
 	EnableBootDebug          bool
+	CheapestRegion           *CheapestRegion
 }
 
 func (r RunnerSpec) Validate() error {

@@ -19,6 +19,8 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -51,6 +53,59 @@ type Config struct {
 	UseAcceleratedNetworking bool   `toml:"use_accelerated_networking"`
 	VnetSubnetID             string `toml:"vnet_subnet_id"`
 	DisableIsolatedNetworks  bool   `toml:"disable_isolated_networks"`
+
+	RegionSelection         RegionSelection `toml:"region_selection"`
+	CandidateRegions        []string        `toml:"candidate_regions"`
+	OnDemandFallback        bool            `toml:"on_demand_fallback"`
+	HomeRegion              string          `toml:"home_region"`
+	StateDir                string          `toml:"state_dir"`
+	ProvisioningWaitSeconds int             `toml:"provisioning_wait_seconds"`
+	PriceCacheTTLMinutes    int             `toml:"price_cache_ttl_minutes"`
+	RegionSkipMinutes       int             `toml:"region_skip_minutes"`
+}
+
+type RegionSelection string
+
+const (
+	RegionSelectionFixed    RegionSelection = "fixed"
+	RegionSelectionCheapest RegionSelection = "cheapest"
+
+	defaultProvisioningWait = 2 * time.Minute
+	defaultPriceCacheTTL    = 6 * time.Hour
+	defaultRegionSkip       = 30 * time.Minute
+)
+
+func (r RegionSelection) Validate() error {
+	switch r {
+	case "", RegionSelectionFixed, RegionSelectionCheapest:
+		return nil
+	}
+	return fmt.Errorf("invalid region_selection %q, must be %q or %q", string(r), RegionSelectionFixed, RegionSelectionCheapest)
+}
+
+// NormalizeRegion turns a display name such as "West Europe" into the name
+// that the Azure APIs return, such as "westeurope".
+func NormalizeRegion(region string) string {
+	return strings.ToLower(strings.ReplaceAll(region, " ", ""))
+}
+
+func (c *Config) ProvisioningWait() time.Duration {
+	return durationOrDefault(c.ProvisioningWaitSeconds, time.Second, defaultProvisioningWait)
+}
+
+func (c *Config) PriceCacheTTL() time.Duration {
+	return durationOrDefault(c.PriceCacheTTLMinutes, time.Minute, defaultPriceCacheTTL)
+}
+
+func (c *Config) RegionSkip() time.Duration {
+	return durationOrDefault(c.RegionSkipMinutes, time.Minute, defaultRegionSkip)
+}
+
+func durationOrDefault(value int, unit, fallback time.Duration) time.Duration {
+	if value == 0 {
+		return fallback
+	}
+	return time.Duration(value) * unit
 }
 
 func (c *Config) Validate() error {
@@ -71,6 +126,22 @@ func (c *Config) Validate() error {
 		if err := ValidateVnetSubnet(c.VnetSubnetID); err != nil {
 			return fmt.Errorf("invalid vnet_subnet_id: %w", err)
 		}
+	}
+
+	if err := c.RegionSelection.Validate(); err != nil {
+		return err
+	}
+	if c.RegionSelection == RegionSelectionCheapest && c.StateDir == "" {
+		return fmt.Errorf("region_selection %q requires state_dir", RegionSelectionCheapest)
+	}
+	if c.ProvisioningWaitSeconds < 0 {
+		return fmt.Errorf("provisioning_wait_seconds must not be negative")
+	}
+	if c.PriceCacheTTLMinutes < 0 {
+		return fmt.Errorf("price_cache_ttl_minutes must not be negative")
+	}
+	if c.RegionSkipMinutes < 0 {
+		return fmt.Errorf("region_skip_minutes must not be negative")
 	}
 
 	return nil
