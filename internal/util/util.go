@@ -30,6 +30,12 @@ import (
 const (
 	ControllerIDTagName = "garm-controller-id"
 	PoolIDTagName       = "garm-pool-id"
+
+	RegionTagName     = "garm-region"
+	PlacementTagName  = "garm-placement"
+	SpotPriceTagName  = "garm-spot-usd-per-hour"
+	PlacementSpot     = "spot"
+	PlacementOnDemand = "on-demand-fallback"
 )
 
 var (

@@ -18,9 +18,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 
 	"github.com/cloudbase/garm-provider-azure/config"
 	"github.com/cloudbase/garm-provider-azure/internal/client"
+	"github.com/cloudbase/garm-provider-azure/internal/placement"
 	"github.com/cloudbase/garm-provider-azure/internal/spec"
 	"github.com/cloudbase/garm-provider-azure/internal/util"
 
@@ -52,6 +57,7 @@ type azureProvider struct {
 	controllerID string
 	azCli        *client.AzureCli
 	cfg          *config.Config
+	prices       placement.PriceSource
 }
 
 // CreateInstance creates a new compute instance in the provider.
@@ -65,6 +71,31 @@ func (a *azureProvider) CreateInstance(ctx context.Context, bootstrapParams para
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to get image details: %w", err)
 	}
+
+	spotRegion, err := a.applyRegionSelection(ctx, runnerSpec)
+	if err != nil {
+		return params.ProviderInstance{}, fmt.Errorf("failed to select a region: %w", err)
+	}
+	resourceGroupCreated := false
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		// The skip marker goes first. The rollback waits until Azure has deleted
+		// the resource group, and concurrent creates must avoid the region in the meantime.
+		if spotRegion != nil {
+			if skipErr := spotRegion.skip(err); skipErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to skip region %s: %w", spotRegion.name, skipErr))
+			}
+		}
+		if !resourceGroupCreated {
+			return
+		}
+		if cleanupErr := a.azCli.DeleteResourceGroup(ctx, runnerSpec.BootstrapParams.Name, true); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to clean up resource group: %w", cleanupErr))
+		}
+	}()
 
 	var sizeSpec spec.VMSizeEphemeralDiskSizeLimits
 	if runnerSpec.UseEphemeralStorage {
@@ -95,16 +126,7 @@ func (a *azureProvider) CreateInstance(ctx context.Context, bootstrapParams para
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to create resource group: %w", err)
 	}
-
-	defer func() {
-		if err == nil {
-			return
-		}
-
-		if cleanupErr := a.azCli.DeleteResourceGroup(ctx, runnerSpec.BootstrapParams.Name, true); cleanupErr != nil {
-			err = errors.Join(err, fmt.Errorf("failed to clean up resource group: %w", cleanupErr))
-		}
-	}()
+	resourceGroupCreated = true
 
 	var pubIPID string
 	var pubIP string
@@ -134,7 +156,11 @@ func (a *azureProvider) CreateInstance(ctx context.Context, bootstrapParams para
 		return params.ProviderInstance{}, fmt.Errorf("failed to create NIC: %w", err)
 	}
 
-	err = a.azCli.CreateVirtualMachine(ctx, runnerSpec, *nic.ID, sizeSpec)
+	var provisioningWait time.Duration
+	if spotRegion != nil {
+		provisioningWait = a.cfg.ProvisioningWait()
+	}
+	err = a.azCli.CreateVirtualMachineAndWait(ctx, runnerSpec, *nic.ID, sizeSpec, provisioningWait)
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to create VM: %w", err)
 	}
@@ -159,6 +185,86 @@ func (a *azureProvider) CreateInstance(ctx context.Context, bootstrapParams para
 		})
 	}
 	return instance, nil
+}
+
+type selectedSpotRegion struct {
+	name    string
+	vmSize  string
+	state   *placement.State
+	skipFor time.Duration
+}
+
+func (s *selectedSpotRegion) skip(cause error) error {
+	return s.state.SkipRegion(s.name, s.vmSize, time.Now().Add(s.skipFor), cause.Error())
+}
+
+func (a *azureProvider) applyRegionSelection(ctx context.Context, runnerSpec *spec.RunnerSpec) (*selectedSpotRegion, error) {
+	cheapest := runnerSpec.CheapestRegion
+	if cheapest == nil {
+		return nil, nil
+	}
+
+	state, err := placement.OpenState(a.cfg.StateDir)
+	if err != nil {
+		return nil, err
+	}
+	osType := placement.Linux
+	if runnerSpec.BootstrapParams.OSType == params.Windows {
+		osType = placement.Windows
+	}
+	selector := placement.Selector{Prices: a.prices, State: state, PriceTTL: a.cfg.PriceCacheTTL()}
+	placed, err := selector.Select(ctx, placement.Request{
+		VMSize:           runnerSpec.VMSize,
+		OS:               osType,
+		CandidateRegions: cheapest.CandidateRegions,
+		OnDemandFallback: cheapest.OnDemandFallback,
+		HomeRegion:       cheapest.HomeRegion,
+	}, a.spotRegionCheck(runnerSpec.VMSize))
+	if err != nil {
+		return nil, err
+	}
+
+	switch placed := placed.(type) {
+	case placement.Spot:
+		a.azCli.SetLocation(placed.Region)
+		runnerSpec.Tags[util.RegionTagName] = to.Ptr(placed.Region)
+		runnerSpec.Tags[util.PlacementTagName] = to.Ptr(util.PlacementSpot)
+		runnerSpec.Tags[util.SpotPriceTagName] = to.Ptr(strconv.FormatFloat(placed.USDPerHour, 'f', -1, 64))
+		return &selectedSpotRegion{name: placed.Region, vmSize: runnerSpec.VMSize, state: state, skipFor: a.cfg.RegionSkip()}, nil
+	case placement.OnDemand:
+		a.azCli.SetLocation(placed.Region)
+		runnerSpec.Spot = false
+		runnerSpec.Tags[util.RegionTagName] = to.Ptr(placed.Region)
+		runnerSpec.Tags[util.PlacementTagName] = to.Ptr(util.PlacementOnDemand)
+		return nil, nil
+	}
+	return nil, fmt.Errorf("unknown placement %T", placed)
+}
+
+func (a *azureProvider) spotRegionCheck(vmSize string) placement.RegionCheck {
+	return func(ctx context.Context, region string) (string, error) {
+		free, err := a.azCli.FreeSpotCores(ctx, region)
+		if err != nil {
+			return "", err
+		}
+		if free <= 0 {
+			return "no free Spot vCPU quota", nil
+		}
+
+		size, offered, err := a.azCli.GetVMSizeInLocation(ctx, region, vmSize)
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case !offered:
+			return "the VM size is not offered", nil
+		case size.LocationRestricted:
+			return "the VM size is restricted for this subscription", nil
+		case size.VCPUs > free:
+			return fmt.Sprintf("%d Spot vCPUs free, %d needed", free, size.VCPUs), nil
+		}
+		return "", nil
+	}
 }
 
 func (a *azureProvider) resolveSubnetID(ctx context.Context, runnerSpec *spec.RunnerSpec) (string, error) {
