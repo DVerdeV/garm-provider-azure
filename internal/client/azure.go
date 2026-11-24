@@ -16,12 +16,16 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v5"
@@ -30,6 +34,14 @@ import (
 	"github.com/cloudbase/garm-provider-azure/config"
 	"github.com/cloudbase/garm-provider-azure/internal/spec"
 	"github.com/cloudbase/garm-provider-azure/internal/util"
+)
+
+const (
+	// Azure counts Spot vCPUs under the name of the older Low Priority offer.
+	spotCoresUsageName = "lowPriorityCores"
+
+	// The SDK default of 30 seconds would use up most of a short wait before the first answer.
+	defaultPollFrequency = 5 * time.Second
 )
 
 func NewAzCLI(cfg *config.Config) (*AzureCli, error) {
@@ -84,6 +96,11 @@ func NewAzCLI(cfg *config.Config) (*AzureCli, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	usageClient, err := armcompute.NewUsageClient(cfg.Credentials.SubscriptionID, creds, &opts)
+	if err != nil {
+		return nil, err
+	}
 	azCli := &AzureCli{
 		cfg:            cfg,
 		cred:           creds,
@@ -97,6 +114,7 @@ func NewAzCLI(cfg *config.Config) (*AzureCli, error) {
 		extCli:         extClient,
 		location:       cfg.Location,
 		resourceSKUCli: skuCLI,
+		usageCli:       usageClient,
 	}
 	return azCli, nil
 }
@@ -114,8 +132,10 @@ type AzureCli struct {
 	pubIPCli       *armnetwork.PublicIPAddressesClient
 	extCli         *armcompute.VirtualMachineExtensionsClient
 	resourceSKUCli *armcompute.ResourceSKUsClient
+	usageCli       *armcompute.UsageClient
 
-	location string
+	location      string
+	pollFrequency time.Duration
 }
 
 func (a *AzureCli) Config() *config.Config {
@@ -148,6 +168,14 @@ func (a *AzureCli) SetClients(rgCli *armresources.ResourceGroupsClient, netCli *
 	a.pubIPCli = pubIPCli
 	a.extCli = extCli
 	a.resourceSKUCli = skuCli
+}
+
+func (a *AzureCli) SetUsageClient(usageCli *armcompute.UsageClient) {
+	a.usageCli = usageCli
+}
+
+func (a *AzureCli) SetPollFrequency(frequency time.Duration) {
+	a.pollFrequency = frequency
 }
 
 func (a *AzureCli) CreateResourceGroup(ctx context.Context, name string, tags map[string]*string) (*armresources.ResourceGroup, error) {
@@ -302,6 +330,10 @@ func (a *AzureCli) CreatePublicIP(ctx context.Context, baseName string) (*armnet
 }
 
 func (a *AzureCli) CreateVirtualMachine(ctx context.Context, spec *spec.RunnerSpec, networkInterfaceID string, sizeSpec spec.VMSizeEphemeralDiskSizeLimits) error {
+	return a.CreateVirtualMachineAndWait(ctx, spec, networkInterfaceID, sizeSpec, 0)
+}
+
+func (a *AzureCli) CreateVirtualMachineAndWait(ctx context.Context, spec *spec.RunnerSpec, networkInterfaceID string, sizeSpec spec.VMSizeEphemeralDiskSizeLimits, wait time.Duration) error {
 	if spec == nil {
 		return fmt.Errorf("invalid nil runner spec")
 	}
@@ -319,7 +351,7 @@ func (a *AzureCli) CreateVirtualMachine(ctx context.Context, spec *spec.RunnerSp
 		Properties: properties,
 	}
 
-	_, err = a.vmCli.BeginCreateOrUpdate(ctx, spec.BootstrapParams.Name, spec.BootstrapParams.Name, parameters, nil)
+	poller, err := a.vmCli.BeginCreateOrUpdate(ctx, spec.BootstrapParams.Name, spec.BootstrapParams.Name, parameters, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create VM: %w", err)
 	}
@@ -337,7 +369,87 @@ func (a *AzureCli) CreateVirtualMachine(ctx context.Context, spec *spec.RunnerSp
 		}
 	}
 
-	return nil
+	if wait <= 0 {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	frequency := a.pollFrequency
+	if frequency == 0 {
+		frequency = defaultPollFrequency
+	}
+	_, err = poller.PollUntilDone(waitCtx, &runtime.PollUntilDoneOptions{Frequency: frequency})
+	waitEndedWithoutResult := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+	if err == nil || waitEndedWithoutResult {
+		return nil
+	}
+	return fmt.Errorf("VM provisioning failed: %w", err)
+}
+
+func (a *AzureCli) FreeSpotCores(ctx context.Context, location string) (int64, error) {
+	pager := a.usageCli.NewListPager(location, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to list compute usage in %s: %w", location, err)
+		}
+		for _, usage := range page.Value {
+			if usage == nil || usage.Name == nil || usage.Name.Value == nil || *usage.Name.Value != spotCoresUsageName {
+				continue
+			}
+			if usage.Limit == nil || usage.CurrentValue == nil {
+				return 0, fmt.Errorf("compute usage in %s has an incomplete %s entry", location, spotCoresUsageName)
+			}
+			return *usage.Limit - int64(*usage.CurrentValue), nil
+		}
+	}
+	return 0, fmt.Errorf("compute usage in %s has no %s entry", location, spotCoresUsageName)
+}
+
+type VMSizeInLocation struct {
+	VCPUs              int64
+	LocationRestricted bool
+}
+
+func (a *AzureCli) GetVMSizeInLocation(ctx context.Context, location, vmSize string) (size VMSizeInLocation, offered bool, err error) {
+	opts := &armcompute.ResourceSKUsClientListOptions{
+		Filter: to.Ptr(fmt.Sprintf("location eq '%s'", location)),
+	}
+	pager := a.resourceSKUCli.NewListPager(opts)
+	for pager.More() {
+		page, listErr := pager.NextPage(ctx)
+		if listErr != nil {
+			return VMSizeInLocation{}, false, fmt.Errorf("failed to list VM sizes in %s: %w", location, listErr)
+		}
+		for _, sku := range page.Value {
+			if sku == nil || sku.ResourceType == nil || sku.Name == nil {
+				continue
+			}
+			if *sku.ResourceType != "virtualMachines" || !strings.EqualFold(*sku.Name, vmSize) {
+				continue
+			}
+
+			for _, capability := range sku.Capabilities {
+				if capability == nil || capability.Name == nil || capability.Value == nil || *capability.Name != "vCPUs" {
+					continue
+				}
+				size.VCPUs, err = strconv.ParseInt(*capability.Value, 10, 64)
+				if err != nil {
+					return VMSizeInLocation{}, false, fmt.Errorf("failed to parse the vCPU count of %s: %w", vmSize, err)
+				}
+			}
+			if size.VCPUs <= 0 {
+				return VMSizeInLocation{}, false, fmt.Errorf("%s reports no vCPU count in %s", vmSize, location)
+			}
+			for _, restriction := range sku.Restrictions {
+				if restriction != nil && restriction.Type != nil && *restriction.Type == armcompute.ResourceSKURestrictionsTypeLocation {
+					size.LocationRestricted = true
+				}
+			}
+			return size, true, nil
+		}
+	}
+	return VMSizeInLocation{}, false, nil
 }
 
 func (a *AzureCli) GetMaxEphemeralDiskSize(ctx context.Context, vmSize string) (spec.VMSizeEphemeralDiskSizeLimits, error) {
