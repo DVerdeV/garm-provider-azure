@@ -360,10 +360,10 @@ If no region passes the checks, the result depends on `on_demand_fallback`:
 - With `on_demand_fallback = true`, the provider creates a regular VM in `home_region`.
 - With `on_demand_fallback = false`, the provider writes a no-spot record and the create fails.
 
-If the provider cannot judge the regions, the create fails with no fallback and no no-spot record. The provider cannot judge the regions in these cases:
+If the provider cannot judge the regions, it writes a no-spot record and the create fails. The provider does not create a regular VM in this case, whatever the value of `on_demand_fallback`. The provider cannot judge the regions in these cases:
 
 - The price API fails and `state_dir` has no cached ranking for the VM size. If a cached ranking exists, the provider uses it, however old it is.
-- The price API has no Spot price for the VM size.
+- The price API has no Spot price for the VM size and the OS of the pool.
 - Every quota or VM size check returned an error, for example because the credentials are not valid. A single region whose check returns an error only counts as a region that did not pass.
 
 ### Files in `state_dir`
@@ -376,7 +376,7 @@ The provider writes each file as one line of JSON. Times are in UTC. `<os>` is `
 | --- | --- | --- |
 | `prices-<vm_size>-<os>.json` | The provider reads a ranking from the price API. | Yes. A file older than `price_cache_ttl_minutes` is replaced. |
 | `skip-<region>-<vm_size>.json` | A create fails in a selected region. | Yes. The region is skipped for the VM size until `expires_at`. |
-| `no-spot-<os>.json` | No region passes the checks and `on_demand_fallback` is `false`. | No. The file is for other tools. |
+| `no-spot-<os>.json` | No region passes the checks and `on_demand_fallback` is `false`, or the provider cannot judge the regions. | No. The file is for other tools. |
 
 A price ranking, here formatted for reading:
 
@@ -403,7 +403,7 @@ A skip marker. `reason` is the error that the create returned:
 }
 ```
 
-A no-spot record. `rejected` lists every region that the provider checked, in price order:
+A no-spot record when no region passes the checks. `rejected` lists every region that the provider checked, in price order:
 
 ```json
 {
@@ -417,6 +417,22 @@ A no-spot record. `rejected` lists every region that the provider checked, in pr
     ]
 }
 ```
+
+If the provider cannot judge the regions, `rejected` has one entry with an empty `region`. Its `reason` names the case and includes the error:
+
+```json
+{
+    "os": "linux",
+    "vm_size": "Standard_D2ads_v5",
+    "recorded_at": "2026-11-24T12:00:00Z",
+    "recorded_at_unix": 1795521600,
+    "rejected": [
+        {"region": "", "reason": "the price API failed: the price API answered 503 Service Unavailable"}
+    ]
+}
+```
+
+The `reason` starts with `the price API failed:`, `the price API has no Spot price for`, or `failed to check any region:`.
 
 The provider overwrites a no-spot record and never deletes it, so the file can describe a shortage that has ended. A tool that reads the record must compare `recorded_at_unix`, in seconds since the Unix epoch, with the current time:
 
