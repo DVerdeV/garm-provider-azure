@@ -17,6 +17,8 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -664,6 +666,60 @@ func TestCheapestRegionFallsBackToARegularVMInTheHomeRegion(t *testing.T) {
 	assert.Equal(t, "on-demand-fallback", *vm.Tags["garm-placement"])
 	assert.NotContains(t, vm.Tags, "garm-spot-usd-per-hour")
 	assert.NotContains(t, c.stateFiles(t), "no-spot-linux.json")
+}
+
+func TestCheapestRegionRecordsNoSpotWhenTheRegionsCannotBeJudged(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(c *cheapestRegionTest)
+		reason  string
+	}{
+		{
+			name:    "the price API fails and nothing is cached",
+			prepare: func(c *cheapestRegionTest) { c.prices.SetStatus(http.StatusServiceUnavailable) },
+			reason:  "the price API failed: the price API answered 503 Service Unavailable",
+		},
+		{
+			name:    "the price API has no Spot price for the size and OS",
+			prepare: func(c *cheapestRegionTest) { c.prices.SetPrices(placementtest.WindowsSpot("eastus", 0.05)) },
+			reason:  "the price API has no Spot price for Standard_D2ads_v5 (linux)",
+		},
+	}
+
+	for _, tt := range tests {
+		for _, fallback := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, on_demand_fallback %t", tt.name, fallback), func(t *testing.T) {
+				c := newCheapestRegionTest(t)
+				c.cfg.OnDemandFallback = fallback
+				tt.prepare(c)
+
+				before := time.Now()
+				_, err := c.create(spotPool)
+
+				require.Error(t, err)
+				var noSpot *placement.NoSpotRegionError
+				assert.False(t, errors.As(err, &noSpot))
+				assert.Empty(t, c.azure.locations)
+				raw, err := os.ReadFile(filepath.Join(c.cfg.StateDir, "no-spot-linux.json"))
+				require.NoError(t, err)
+				var record struct {
+					OS             string                `json:"os"`
+					VMSize         string                `json:"vm_size"`
+					RecordedAt     time.Time             `json:"recorded_at"`
+					RecordedAtUnix int64                 `json:"recorded_at_unix"`
+					Rejected       []placement.Rejection `json:"rejected"`
+				}
+				require.NoError(t, json.Unmarshal(raw, &record))
+				assert.Equal(t, "linux", record.OS)
+				assert.Equal(t, spotVMSize, record.VMSize)
+				assert.InDelta(t, before.Unix(), record.RecordedAtUnix, 60)
+				assert.Equal(t, record.RecordedAtUnix, record.RecordedAt.Unix())
+				require.Len(t, record.Rejected, 1)
+				assert.Empty(t, record.Rejected[0].Region)
+				assert.Contains(t, record.Rejected[0].Reason, tt.reason)
+			})
+		}
+	}
 }
 
 func TestCheapestRegionRanksWindowsPoolsByWindowsPrices(t *testing.T) {

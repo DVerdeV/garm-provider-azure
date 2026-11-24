@@ -132,14 +132,16 @@ func (s Selector) ranking(ctx context.Context, vmSize string, osType OS, now tim
 	}
 
 	fresh, err := s.Prices.SpotRankings(ctx, vmSize)
-	if err == nil && len(fresh[osType]) == 0 {
+	if err != nil {
+		err = fmt.Errorf("the price API failed: %w", err)
+	} else if len(fresh[osType]) == 0 {
 		err = fmt.Errorf("the price API has no Spot price for %s (%s)", vmSize, osType)
 	}
 	if err != nil {
 		if haveCache {
 			return cached, nil
 		}
-		return nil, err
+		return nil, s.recordUnjudged(ctx, vmSize, osType, now, err)
 	}
 
 	for rankedOS, ranking := range fresh {
@@ -151,6 +153,17 @@ func (s Selector) ranking(ctx context.Context, vmSize string, osType OS, now tim
 		}
 	}
 	return fresh[osType], nil
+}
+
+// A cancelled create says nothing about Spot capacity, so it records nothing.
+func (s Selector) recordUnjudged(ctx context.Context, vmSize string, osType OS, now time.Time, cause error) error {
+	if ctx.Err() != nil {
+		return cause
+	}
+	if err := s.State.recordNoSpot(osType, vmSize, []Rejection{{Reason: cause.Error()}}, now); err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
 }
 
 func (r Ranking) within(candidates []string) Ranking {

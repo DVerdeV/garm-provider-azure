@@ -300,15 +300,63 @@ func TestSelectTreatsAFailedCheckAsOneUnusableRegion(t *testing.T) {
 	assert.Equal(t, placement.Spot{Region: "westus2", USDPerHour: 0.01}, got)
 }
 
-func TestSelectFailsWithoutARecordWhenThereAreNoPricesAtAll(t *testing.T) {
+func TestSelectRecordsNoSpotWhenThePriceAPIFailsAndNothingIsCached(t *testing.T) {
 	f := newFixture(t, placementtest.LinuxSpot("eastus", 0.02))
 	f.api.SetStatus(http.StatusServiceUnavailable)
+	request := linuxRequest()
+	request.OnDemandFallback = true
 
-	_, err := f.selector.Select(context.Background(), linuxRequest(), everyRegionUsable)
+	got, err := f.selector.Select(context.Background(), request, everyRegionUsable)
 
-	require.Error(t, err)
+	require.ErrorContains(t, err, "503 Service Unavailable")
+	assert.Nil(t, got)
 	var noSpot *placement.NoSpotRegionError
 	assert.False(t, errors.As(err, &noSpot))
+	assert.Equal(t, []string{"no-spot-linux.json"}, f.stateFiles(t))
+	raw, err := os.ReadFile(filepath.Join(f.stateDir, "no-spot-linux.json"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"os": "linux",
+		"vm_size": "Standard_D2ads_v5",
+		"recorded_at": "2026-11-24T12:00:00Z",
+		"recorded_at_unix": 1795521600,
+		"rejected": [
+			{"region": "", "reason": "the price API failed: the price API answered 503 Service Unavailable"}
+		]
+	}`, string(raw))
+}
+
+func TestSelectRecordsNoSpotWhenThePriceAPIHasNoSpotPriceForTheOS(t *testing.T) {
+	f := newFixture(t, placementtest.WindowsSpot("eastus", 0.05))
+	request := linuxRequest()
+	request.OnDemandFallback = true
+
+	got, err := f.selector.Select(context.Background(), request, everyRegionUsable)
+
+	require.ErrorContains(t, err, "no Spot price")
+	assert.Nil(t, got)
+	assert.NotContains(t, f.stateFiles(t), "no-spot-windows.json")
+	raw, err := os.ReadFile(filepath.Join(f.stateDir, "no-spot-linux.json"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"os": "linux",
+		"vm_size": "Standard_D2ads_v5",
+		"recorded_at": "2026-11-24T12:00:00Z",
+		"recorded_at_unix": 1795521600,
+		"rejected": [
+			{"region": "", "reason": "the price API has no Spot price for Standard_D2ads_v5 (linux)"}
+		]
+	}`, string(raw))
+}
+
+func TestSelectRecordsNothingWhenTheCreateIsCancelledDuringThePriceFetch(t *testing.T) {
+	f := newFixture(t, placementtest.LinuxSpot("eastus", 0.02))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := f.selector.Select(ctx, linuxRequest(), everyRegionUsable)
+
+	require.ErrorIs(t, err, context.Canceled)
 	assert.Empty(t, f.stateFiles(t))
 }
 
