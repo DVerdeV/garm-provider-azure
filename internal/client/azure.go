@@ -280,6 +280,10 @@ func (a *AzureCli) CreateNetWorkInterface(ctx context.Context, baseName, subnetI
 func (a *AzureCli) CreatePublicIP(ctx context.Context, baseName string) (*armnetwork.PublicIPAddress, error) {
 	parameters := armnetwork.PublicIPAddress{
 		Location: to.Ptr(a.location),
+		// Azure retired Basic public IPs, so the SKU is not left to the service default.
+		SKU: &armnetwork.PublicIPAddressSKU{
+			Name: to.Ptr(armnetwork.PublicIPAddressSKUNameStandard),
+		},
 		Properties: &armnetwork.PublicIPAddressPropertiesFormat{
 			PublicIPAllocationMethod: to.Ptr(armnetwork.IPAllocationMethodStatic),
 		},
