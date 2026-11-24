@@ -111,18 +111,18 @@ func (s *State) storeRanking(vmSize string, osType OS, ranking Ranking, fetchedA
 	})
 }
 
-func (s *State) recordNoSpot(noSpot *NoSpotRegionError, at time.Time) error {
-	name, err := safeFileName("no-spot", string(noSpot.OS))
+func (s *State) recordNoSpot(osType OS, vmSize string, rejected []Rejection, at time.Time) error {
+	name, err := safeFileName("no-spot", string(osType))
 	if err != nil {
 		return err
 	}
 	at = at.UTC().Truncate(time.Second)
 	return s.write(name, noSpotFile{
-		OS:             noSpot.OS,
-		VMSize:         noSpot.VMSize,
+		OS:             osType,
+		VMSize:         vmSize,
 		RecordedAt:     at,
 		RecordedAtUnix: at.Unix(),
-		Rejected:       noSpot.Rejected,
+		Rejected:       rejected,
 	})
 }
 

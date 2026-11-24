@@ -119,7 +119,7 @@ func (s Selector) Select(ctx context.Context, req Request, check RegionCheck) (P
 	}
 
 	noSpot := &NoSpotRegionError{VMSize: req.VMSize, OS: req.OS, Rejected: rejected}
-	if err := s.State.recordNoSpot(noSpot, now); err != nil {
+	if err := s.State.recordNoSpot(noSpot.OS, noSpot.VMSize, noSpot.Rejected, now); err != nil {
 		return nil, errors.Join(noSpot, err)
 	}
 	return nil, noSpot
