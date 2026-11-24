@@ -684,6 +684,15 @@ func TestCheapestRegionRecordsNoSpotWhenTheRegionsCannotBeJudged(t *testing.T) {
 			prepare: func(c *cheapestRegionTest) { c.prices.SetPrices(placementtest.WindowsSpot("eastus", 0.05)) },
 			reason:  "the price API has no Spot price for Standard_D2ads_v5 (linux)",
 		},
+		{
+			name: "every region check fails",
+			prepare: func(c *cheapestRegionTest) {
+				for region := range c.azure.freeSpotCores {
+					delete(c.azure.freeSpotCores, region)
+				}
+			},
+			reason: "failed to check any region: westus2: failed to list compute usage in westus2",
+		},
 	}
 
 	for _, tt := range tests {

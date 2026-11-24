@@ -112,7 +112,7 @@ func (s Selector) Select(ctx context.Context, req Request, check RegionCheck) (P
 
 	noRegionCouldBeJudged := len(checkErrs) > 0 && len(checkErrs) == len(rejected)
 	if noRegionCouldBeJudged {
-		return nil, fmt.Errorf("failed to check any region: %w", errors.Join(checkErrs...))
+		return nil, s.recordUnjudged(ctx, req.VMSize, req.OS, now, fmt.Errorf("failed to check any region: %w", errors.Join(checkErrs...)))
 	}
 	if req.OnDemandFallback {
 		return OnDemand{Region: req.HomeRegion}, nil

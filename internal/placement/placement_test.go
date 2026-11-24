@@ -265,7 +265,7 @@ func TestSelectFallsBackToOnDemandInTheHomeRegion(t *testing.T) {
 	assert.NotContains(t, f.stateFiles(t), "no-spot-linux.json")
 }
 
-func TestSelectDoesNotRecordNoSpotWhenEveryCheckFails(t *testing.T) {
+func TestSelectRecordsNoSpotWhenEveryCheckFails(t *testing.T) {
 	f := newFixture(t,
 		placementtest.LinuxSpot("westus2", 0.01),
 		placementtest.LinuxSpot("eastus", 0.02),
@@ -274,14 +274,54 @@ func TestSelectDoesNotRecordNoSpotWhenEveryCheckFails(t *testing.T) {
 	request.OnDemandFallback = true
 	unauthorized := errors.New("AuthorizationFailed")
 
-	_, err := f.selector.Select(context.Background(), request, func(context.Context, string) (string, error) {
+	got, err := f.selector.Select(context.Background(), request, func(context.Context, string) (string, error) {
 		return "", unauthorized
 	})
 
 	require.ErrorIs(t, err, unauthorized)
+	assert.Nil(t, got)
 	var noSpot *placement.NoSpotRegionError
 	assert.False(t, errors.As(err, &noSpot))
-	assert.NotContains(t, f.stateFiles(t), "no-spot-linux.json")
+	raw, err := os.ReadFile(filepath.Join(f.stateDir, "no-spot-linux.json"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"os": "linux",
+		"vm_size": "Standard_D2ads_v5",
+		"recorded_at": "2026-11-24T12:00:00Z",
+		"recorded_at_unix": 1795521600,
+		"rejected": [
+			{"region": "", "reason": "failed to check any region: westus2: AuthorizationFailed\neastus: AuthorizationFailed"}
+		]
+	}`, string(raw))
+}
+
+func TestSelectJudgesTheRegionsWhenOnlySomeChecksFail(t *testing.T) {
+	f := newFixture(t,
+		placementtest.LinuxSpot("westus2", 0.01),
+		placementtest.LinuxSpot("eastus", 0.02),
+	)
+
+	_, err := f.selector.Select(context.Background(), linuxRequest(), func(_ context.Context, region string) (string, error) {
+		if region == "westus2" {
+			return "", errors.New("AuthorizationFailed")
+		}
+		return "0 of 2 Spot vCPUs free", nil
+	})
+
+	var noSpot *placement.NoSpotRegionError
+	require.ErrorAs(t, err, &noSpot)
+	raw, err := os.ReadFile(filepath.Join(f.stateDir, "no-spot-linux.json"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"os": "linux",
+		"vm_size": "Standard_D2ads_v5",
+		"recorded_at": "2026-11-24T12:00:00Z",
+		"recorded_at_unix": 1795521600,
+		"rejected": [
+			{"region": "westus2", "reason": "check failed: AuthorizationFailed"},
+			{"region": "eastus", "reason": "0 of 2 Spot vCPUs free"}
+		]
+	}`, string(raw))
 }
 
 func TestSelectTreatsAFailedCheckAsOneUnusableRegion(t *testing.T) {
